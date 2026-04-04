@@ -242,3 +242,116 @@ class TestTextMentionAgent:
         )
 
         ch._handle_message.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Sender identity (name_map + pushName)
+# ---------------------------------------------------------------------------
+
+
+class TestSenderIdentity:
+
+    @pytest.mark.asyncio
+    async def test_name_map_overrides_push_name(self):
+        ch = WhatsAppChannel(
+            {"enabled": True, "nameMap": {"447712345678": "Sy"}},
+            MagicMock(),
+        )
+        ch._handle_message = AsyncMock()
+
+        await ch._handle_bridge_message(
+            json.dumps(
+                {
+                    "type": "message",
+                    "id": "n1",
+                    "sender": "447712345678@s.whatsapp.net",
+                    "pn": "447712345678@s.whatsapp.net",
+                    "content": "hello",
+                    "timestamp": 1,
+                    "isGroup": False,
+                    "pushName": "Simon W",
+                }
+            )
+        )
+
+        ch._handle_message.assert_awaited_once()
+        meta = ch._handle_message.await_args.kwargs["metadata"]
+        assert meta["sender_name"] == "Sy"
+
+    @pytest.mark.asyncio
+    async def test_push_name_used_when_no_name_map(self):
+        ch = WhatsAppChannel({"enabled": True}, MagicMock())
+        ch._handle_message = AsyncMock()
+
+        await ch._handle_bridge_message(
+            json.dumps(
+                {
+                    "type": "message",
+                    "id": "n2",
+                    "sender": "449999999999@s.whatsapp.net",
+                    "pn": "449999999999@s.whatsapp.net",
+                    "content": "hi",
+                    "timestamp": 1,
+                    "isGroup": False,
+                    "pushName": "Jay C",
+                }
+            )
+        )
+
+        ch._handle_message.assert_awaited_once()
+        meta = ch._handle_message.await_args.kwargs["metadata"]
+        assert meta["sender_name"] == "Jay C"
+
+    @pytest.mark.asyncio
+    async def test_no_sender_name_when_both_empty(self):
+        ch = WhatsAppChannel({"enabled": True}, MagicMock())
+        ch._handle_message = AsyncMock()
+
+        await ch._handle_bridge_message(
+            json.dumps(
+                {
+                    "type": "message",
+                    "id": "n3",
+                    "sender": "440000000000@s.whatsapp.net",
+                    "pn": "",
+                    "content": "anon",
+                    "timestamp": 1,
+                    "isGroup": False,
+                    "pushName": "",
+                }
+            )
+        )
+
+        ch._handle_message.assert_awaited_once()
+        meta = ch._handle_message.await_args.kwargs["metadata"]
+        assert "sender_name" not in meta
+
+    @pytest.mark.asyncio
+    async def test_group_message_uses_participant_for_sender_id(self):
+        ch = WhatsAppChannel(
+            {"enabled": True, "nameMap": {"447700111222": "Lys"}},
+            MagicMock(),
+        )
+        ch._handle_message = AsyncMock()
+
+        await ch._handle_bridge_message(
+            json.dumps(
+                {
+                    "type": "message",
+                    "id": "n4",
+                    "sender": "group@g.us",
+                    "pn": "",
+                    "content": "hey alfred",
+                    "timestamp": 1,
+                    "isGroup": True,
+                    "participant": "447700111222@s.whatsapp.net",
+                    "pushName": "Alyssa",
+                    "wasMentioned": False,
+                }
+            )
+        )
+
+        ch._handle_message.assert_awaited_once()
+        kwargs = ch._handle_message.await_args.kwargs
+        assert kwargs["sender_id"] == "447700111222"
+        assert kwargs["metadata"]["sender_name"] == "Lys"

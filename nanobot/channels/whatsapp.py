@@ -28,6 +28,7 @@ class WhatsAppConfig(Base):
     allow_from: list[str] = Field(default_factory=list)
     group_policy: Literal["open", "mention"] = "open"  # "open" responds to all, "mention" only when @mentioned
     name_aliases: list[str] = Field(default_factory=list)  # text patterns that count as mentions
+    name_map: dict[str, str] = Field(default_factory=dict)  # sender_id -> display name
 
 
 class WhatsAppChannel(BaseChannel):
@@ -248,9 +249,18 @@ class WhatsAppChannel(BaseChannel):
                 if not was_mentioned and not self._text_mentions_agent(content):
                     return
 
-            user_id = pn if pn else sender
+            # In groups, participant is the actual sender; remoteJid is the group
+            participant = data.get("participant", "")
+            if is_group and participant:
+                user_id = participant
+            else:
+                user_id = pn if pn else sender
             sender_id = user_id.split("@")[0] if "@" in user_id else user_id
-            logger.info("Sender {}", sender)
+
+            # Resolve display name: config name_map > WhatsApp pushName > empty
+            push_name = data.get("pushName", "")
+            sender_name = self.config.name_map.get(sender_id, push_name)
+            logger.info("Sender {} ({})", sender_id, sender_name or "unknown")
 
             # Handle voice transcription if it's a voice message
             if content == "[Voice Message]":
@@ -282,6 +292,7 @@ class WhatsAppChannel(BaseChannel):
                     "message_id": message_id,
                     "timestamp": data.get("timestamp"),
                     "is_group": data.get("isGroup", False),
+                    **({"sender_name": sender_name} if sender_name else {}),
                 },
             )
 

@@ -29,6 +29,8 @@ export interface InboundMessage {
   content: string;
   timestamp: number;
   isGroup: boolean;
+  pushName?: string;
+  participant?: string;
   wasMentioned?: boolean;
   media?: string[];
 }
@@ -180,6 +182,8 @@ export class WhatsAppClient {
           content: finalContent,
           timestamp: msg.messageTimestamp as number,
           isGroup,
+          pushName: msg.pushName || '',
+          ...(isGroup && msg.key.participant ? { participant: msg.key.participant } : {}),
           ...(isGroup ? { wasMentioned } : {}),
           ...(mediaPaths.length > 0 ? { media: mediaPaths } : {}),
         });
