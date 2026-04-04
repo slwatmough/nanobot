@@ -6,6 +6,7 @@ from nanobot.agent.tools.filesystem import (
     EditFileTool,
     ListDirTool,
     ReadFileTool,
+    WriteFileTool,
     _find_match,
 )
 
@@ -408,3 +409,19 @@ class TestWorkspaceRestriction:
         assert "Error" in result
         assert "outside" in result.lower()
         assert skill_file.read_text() == "# Weather\nOriginal content."
+
+
+# ---------------------------------------------------------------------------
+# WriteFileTool delivery hint
+# ---------------------------------------------------------------------------
+
+
+class TestWriteFileDeliveryHint:
+
+    @pytest.mark.asyncio
+    async def test_write_file_includes_message_hint(self, tmp_path):
+        tool = WriteFileTool(workspace=tmp_path)
+        result = await tool.execute(path="output.md", content="# Report\nDone.")
+        assert "Successfully wrote" in result
+        assert 'message(content="..."' in result
+        assert "output.md" in result

@@ -1,9 +1,12 @@
 """Message tool for sending messages to users."""
 
+from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 from nanobot.agent.tools.base import Tool
+from nanobot.agent.tools.filesystem import _is_under
 from nanobot.bus.events import OutboundMessage
+from nanobot.config.paths import get_media_dir
 
 
 class MessageTool(Tool):
@@ -15,12 +18,16 @@ class MessageTool(Tool):
         default_channel: str = "",
         default_chat_id: str = "",
         default_message_id: str | None = None,
+        workspace: Path | None = None,
+        allowed_dir: Path | None = None,
     ):
         self._send_callback = send_callback
         self._default_channel = default_channel
         self._default_chat_id = default_chat_id
         self._default_message_id = default_message_id
         self._sent_in_turn: bool = False
+        self._workspace = workspace
+        self._allowed_dir = allowed_dir
 
     def set_context(self, channel: str, chat_id: str, message_id: str | None = None) -> None:
         """Set the current message context."""
@@ -75,6 +82,28 @@ class MessageTool(Tool):
             "required": ["content"]
         }
 
+    def _validate_media(self, media: list[str]) -> list[str]:
+        """Resolve media paths and enforce workspace restriction."""
+        resolved = []
+        for path in media:
+            p = Path(path).expanduser()
+            if not p.is_absolute() and self._workspace:
+                p = self._workspace / p
+            p = p.resolve()
+
+            if self._allowed_dir:
+                media_dir = get_media_dir().resolve()
+                if not any(_is_under(p, d) for d in [self._allowed_dir, media_dir]):
+                    raise PermissionError(
+                        f"Media path {path} is outside allowed directory {self._allowed_dir}"
+                    )
+
+            if not p.is_file():
+                raise FileNotFoundError(f"Media file not found: {path}")
+
+            resolved.append(str(p))
+        return resolved
+
     async def execute(
         self,
         content: str,
@@ -86,7 +115,13 @@ class MessageTool(Tool):
     ) -> str:
         from nanobot.utils.helpers import strip_think
         content = strip_think(content)
-        
+
+        if media:
+            try:
+                media = self._validate_media(media)
+            except (PermissionError, FileNotFoundError) as e:
+                return f"Error: {e}"
+
         channel = channel or self._default_channel
         chat_id = chat_id or self._default_chat_id
         # Only inherit default message_id when targeting the same channel+chat.
