@@ -21,7 +21,13 @@ interface SendMediaCommand {
   fileName?: string;
 }
 
-type BridgeCommand = SendCommand | SendMediaCommand;
+interface PresenceCommand {
+  type: 'presence';
+  to: string;
+  state: 'composing' | 'paused';
+}
+
+type BridgeCommand = SendCommand | SendMediaCommand | PresenceCommand;
 
 interface BridgeMessage {
   type: 'message' | 'status' | 'qr' | 'error';
@@ -110,6 +116,8 @@ export class BridgeServer {
       await this.wa.sendMessage(cmd.to, cmd.text);
     } else if (cmd.type === 'send_media') {
       await this.wa.sendMedia(cmd.to, cmd.filePath, cmd.mimetype, cmd.caption, cmd.fileName);
+    } else if (cmd.type === 'presence') {
+      await this.wa.sendPresence(cmd.to, cmd.state);
     }
   }
 
