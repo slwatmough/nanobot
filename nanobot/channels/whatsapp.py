@@ -27,6 +27,7 @@ class WhatsAppConfig(Base):
     bridge_token: str = ""
     allow_from: list[str] = Field(default_factory=list)
     group_policy: Literal["open", "mention"] = "open"  # "open" responds to all, "mention" only when @mentioned
+    name_aliases: list[str] = Field(default_factory=list)  # text patterns that count as mentions
 
 
 class WhatsAppChannel(BaseChannel):
@@ -51,6 +52,17 @@ class WhatsAppChannel(BaseChannel):
         self._ws = None
         self._connected = False
         self._processed_message_ids: OrderedDict[str, None] = OrderedDict()
+
+    def _text_mentions_agent(self, content: str) -> bool:
+        """Check if message text contains any configured name alias."""
+        if not content or not self.config.name_aliases:
+            return False
+        import re
+        content_lower = content.lower()
+        for alias in self.config.name_aliases:
+            if re.search(r"(?<!\w)" + re.escape(alias.lower()) + r"(?!\w)", content_lower):
+                return True
+        return False
 
     async def login(self, force: bool = False) -> bool:
         """
@@ -194,7 +206,7 @@ class WhatsAppChannel(BaseChannel):
             was_mentioned = data.get("wasMentioned", False)
 
             if is_group and getattr(self.config, "group_policy", "open") == "mention":
-                if not was_mentioned:
+                if not was_mentioned and not self._text_mentions_agent(content):
                     return
 
             user_id = pn if pn else sender

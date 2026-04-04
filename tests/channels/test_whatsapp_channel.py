@@ -155,3 +155,90 @@ async def test_group_policy_mention_accepts_mentioned_group_message():
     kwargs = ch._handle_message.await_args.kwargs
     assert kwargs["chat_id"] == "12345@g.us"
     assert kwargs["sender_id"] == "user"
+
+
+# ---------------------------------------------------------------------------
+# Text-based name alias mention detection
+# ---------------------------------------------------------------------------
+
+
+class TestTextMentionAgent:
+
+    def _make(self, aliases: list[str]) -> WhatsAppChannel:
+        ch = WhatsAppChannel(
+            {"enabled": True, "groupPolicy": "mention", "nameAliases": aliases},
+            MagicMock(),
+        )
+        return ch
+
+    def test_plain_name_match(self):
+        ch = self._make(["alfred"])
+        assert ch._text_mentions_agent("hey alfred can you help") is True
+
+    def test_case_insensitive(self):
+        ch = self._make(["alfred"])
+        assert ch._text_mentions_agent("ALFRED what's up") is True
+
+    def test_dotted_alias(self):
+        ch = self._make(["a.l.f.r.e.d"])
+        assert ch._text_mentions_agent("A.L.F.R.E.D what's the weather") is True
+
+    def test_no_partial_word_match(self):
+        ch = self._make(["alfred"])
+        assert ch._text_mentions_agent("halfrederick is here") is False
+
+    def test_empty_content(self):
+        ch = self._make(["alfred"])
+        assert ch._text_mentions_agent("") is False
+
+    def test_empty_aliases(self):
+        ch = self._make([])
+        assert ch._text_mentions_agent("hey alfred") is False
+
+    def test_name_at_end_of_sentence(self):
+        ch = self._make(["alfred"])
+        assert ch._text_mentions_agent("thanks alfred!") is True
+
+    @pytest.mark.asyncio
+    async def test_group_message_with_text_mention_passes_filter(self):
+        ch = self._make(["alfred"])
+        ch._handle_message = AsyncMock()
+
+        await ch._handle_bridge_message(
+            json.dumps(
+                {
+                    "type": "message",
+                    "id": "m2",
+                    "sender": "group@g.us",
+                    "pn": "user@s.whatsapp.net",
+                    "content": "alfred what time is it",
+                    "timestamp": 1,
+                    "isGroup": True,
+                    "wasMentioned": False,
+                }
+            )
+        )
+
+        ch._handle_message.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_group_message_without_mention_or_alias_dropped(self):
+        ch = self._make(["alfred"])
+        ch._handle_message = AsyncMock()
+
+        await ch._handle_bridge_message(
+            json.dumps(
+                {
+                    "type": "message",
+                    "id": "m3",
+                    "sender": "group@g.us",
+                    "pn": "user@s.whatsapp.net",
+                    "content": "dinner at 7 tonight",
+                    "timestamp": 1,
+                    "isGroup": True,
+                    "wasMentioned": False,
+                }
+            )
+        )
+
+        ch._handle_message.assert_not_called()
