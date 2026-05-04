@@ -76,6 +76,7 @@ class WhatsAppChannel(BaseChannel):
         self._connected = False
         self._processed_message_ids: OrderedDict[str, None] = OrderedDict()
         self._lid_to_phone: dict[str, str] = {}
+        self._typing_tasks: dict[str, asyncio.Task] = {}  # chat_id -> composing loop
         self._bridge_token: str | None = None
 
     def _effective_bridge_token(self) -> str:
@@ -160,9 +161,46 @@ class WhatsAppChannel(BaseChannel):
         self._running = False
         self._connected = False
 
+        for chat_id in list(self._typing_tasks):
+            self._stop_typing(chat_id)
+
         if self._ws:
             await self._ws.close()
             self._ws = None
+
+    # ------------------------------------------------------------------
+    # Typing indicator ("composing" presence)
+    # ------------------------------------------------------------------
+
+    def _start_typing(self, chat_id: str) -> None:
+        """Start sending 'composing' presence for a chat."""
+        self._stop_typing(chat_id)
+        self._typing_tasks[chat_id] = asyncio.create_task(self._typing_loop(chat_id))
+
+    def _stop_typing(self, chat_id: str) -> None:
+        """Stop the composing indicator for a chat."""
+        task = self._typing_tasks.pop(chat_id, None)
+        if task and not task.done():
+            task.cancel()
+
+    async def _typing_loop(self, chat_id: str) -> None:
+        """Send 'composing' presence repeatedly until cancelled."""
+        try:
+            while self._ws and self._connected:
+                payload = {"type": "presence", "to": chat_id, "state": "composing"}
+                await self._ws.send(json.dumps(payload))
+                await asyncio.sleep(5)
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logger.debug("Typing indicator stopped for {}: {}", chat_id, e)
+        finally:
+            if self._ws and self._connected:
+                try:
+                    payload = {"type": "presence", "to": chat_id, "state": "paused"}
+                    await self._ws.send(json.dumps(payload))
+                except Exception:
+                    pass
 
     async def send(self, msg: OutboundMessage) -> None:
         """Send a message through WhatsApp."""
@@ -171,6 +209,7 @@ class WhatsAppChannel(BaseChannel):
             return
 
         chat_id = msg.chat_id
+        self._stop_typing(chat_id)
 
         if msg.content:
             try:
@@ -275,6 +314,8 @@ class WhatsAppChannel(BaseChannel):
                     media_type = "image" if mime and mime.startswith("image/") else "file"
                     media_tag = f"[{media_type}: {p}]"
                     content = f"{content}\n{media_tag}" if content else media_tag
+
+            self._start_typing(sender)
 
             await self._handle_message(
                 sender_id=sender_id,

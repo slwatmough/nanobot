@@ -285,6 +285,11 @@ export class WhatsAppClient {
     }
   }
 
+  async sendPresence(to: string, state: 'composing' | 'paused'): Promise<void> {
+    if (!this.sock) return;
+    await this.sock.sendPresenceUpdate(state, to);
+  }
+
   async disconnect(): Promise<void> {
     if (this.sock) {
       this.sock.end(undefined);
