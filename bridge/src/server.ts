@@ -42,7 +42,7 @@ export class BridgeServer {
 
     // Bind to localhost only — never expose to external network
     this.wss = new WebSocketServer({
-      host: '127.0.0.1',
+      host: '172.70.0.3',
       port: this.port,
       verifyClient: (info, done) => {
         const origin = info.origin || info.req.headers.origin;
@@ -54,7 +54,7 @@ export class BridgeServer {
         done(true);
       },
     });
-    console.log(`🌉 Bridge server listening on ws://127.0.0.1:${this.port}`);
+    console.log(`🌉 Bridge server listening on ws://172.70.0.3:${this.port}`);
     console.log('🔒 Token authentication enabled');
 
     // Initialize WhatsApp client

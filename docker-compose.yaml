@@ -1,0 +1,29 @@
+networks: 
+  nanobot-net:
+    ipam:
+      config:
+        - subnet: "172.70.0.0/24"
+
+services:
+  nanobot-gateway:
+    image: nanobot
+    container_name: nanobot-gateway
+    command: ["gateway"]
+    volumes:
+      - ~/.nanobot:/home/nanobot/.nanobot
+    depends_on:
+      - nanobot-whatsapp
+    networks:
+      nanobot-net:
+        ipv4_address: 172.70.0.2
+    restart: unless-stopped
+  nanobot-whatsapp:
+    image: nanobot
+    container_name: nanobot-whatsapp
+    command: ["channels", "login", "whatsapp"]
+    volumes:
+      - ~/.nanobot:/home/nanobot/.nanobot
+    networks:
+      nanobot-net:
+        ipv4_address: 172.70.0.3
+    restart: unless-stopped
