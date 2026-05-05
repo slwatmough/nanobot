@@ -65,6 +65,13 @@ class DreamConfig(Base):
         return f"every {hours}h"
 
 
+class AuditDigestConfig(Base):
+    """Schedule for the nightly audit-log digest sent to admin users."""
+
+    cron: str = "0 9 * * *"  # 09:00 daily by default
+    tz: str | None = None  # IANA timezone; falls back to AgentDefaults.timezone
+
+
 class AgentDefaults(Base):
     """Default agent configuration."""
 
@@ -105,6 +112,7 @@ class AgentDefaults(Base):
     # "channel:sender_id" (e.g. "telegram:123456789", "slack:U0123ABC"); a
     # bare sender_id matches on any channel. Empty list = no admins.
     agent_admins: list[str] = Field(default_factory=list)
+    audit_digest: AuditDigestConfig = Field(default_factory=AuditDigestConfig)
     dream: DreamConfig = Field(default_factory=DreamConfig)
 
 

@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
 from loguru import logger
 
+from nanobot.agent.audit_digest import AuditDigest
 from nanobot.agent.autocompact import AutoCompact
 from nanobot.agent.context import ContextBuilder
 from nanobot.agent.hook import AgentHook, AgentHookContext, CompositeHook
@@ -512,6 +513,74 @@ class AgentLoop:
         "read_file", "write_file", "edit_file", "list_dir",
         "glob", "grep", "notebook_edit", "exec",
     })
+
+    def audit_digest(self) -> AuditDigest:
+        """Build (or reuse) an AuditDigest pointed at this loop's audit log."""
+        cached = getattr(self, "_audit_digest", None)
+        if cached is None:
+            cached = AuditDigest(audit_path=self._audit_log_path())
+            self._audit_digest = cached
+        return cached
+
+    async def run_audit_digest(self, *, advance_cursor: bool = True) -> str:
+        """Compute the digest and publish it to each configured admin.
+
+        Always returns the rendered summary (even when nothing was sent),
+        so callers / tests can inspect the result.
+        """
+        digest = self.audit_digest()
+        summary, stats = digest.run(advance_cursor=advance_cursor)
+        recipients = list(self._admin_message_targets())
+        if not recipients:
+            logger.info(
+                "Audit digest computed ({} admin actions) but no admin "
+                "messaging targets are known yet — skipping delivery.",
+                stats.total,
+            )
+            return summary
+        for channel, chat_id in recipients:
+            outbound = OutboundMessage(
+                channel=channel,
+                chat_id=chat_id,
+                content=summary,
+                metadata={"_audit_digest": True},
+            )
+            try:
+                await self.bus.publish_outbound(outbound)
+            except Exception as exc:
+                logger.warning(
+                    "Failed to deliver audit digest to {}:{} — {}",
+                    channel, chat_id, exc,
+                )
+        logger.info(
+            "Audit digest delivered to {} admin(s) ({} actions in window)",
+            len(recipients), stats.total,
+        )
+        return summary
+
+    def _admin_message_targets(self) -> list[tuple[str, str]]:
+        """Resolve admins to deliverable (channel, chat_id) pairs.
+
+        Bare ``agent_admins`` entries (no channel prefix) cannot be
+        delivered to — the digest needs to know which channel to send on
+        — so they are skipped with a one-time warning.
+        """
+        targets: list[tuple[str, str]] = []
+        skipped: list[str] = []
+        for channel, sender in self._agent_admins:
+            if not channel:
+                skipped.append(sender)
+                continue
+            targets.append((channel, sender))
+        if skipped and not getattr(self, "_admin_target_warned", False):
+            self._admin_target_warned = True
+            logger.warning(
+                "agent_admins entries without a channel prefix cannot "
+                "receive the audit digest: {}. Use 'channel:sender_id' "
+                "format (e.g. 'telegram:42') to enable delivery.",
+                ", ".join(skipped),
+            )
+        return targets
 
     def _maybe_audit_tool_calls(self, tool_calls: list[Any]) -> None:
         """Append an audit record for admin tool calls touching the FS."""

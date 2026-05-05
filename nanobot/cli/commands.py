@@ -704,6 +704,13 @@ def _run_gateway(
                 logger.exception("Dream cron job failed")
             return None
 
+        if job.name == "audit_digest":
+            try:
+                await agent.run_audit_digest()
+            except Exception:
+                logger.exception("Audit digest job failed")
+            return None
+
         from nanobot.utils.evaluator import evaluate_response
 
         reminder_note = (
@@ -916,7 +923,7 @@ def _run_gateway(
     agent.dream.max_batch_size = dream_cfg.max_batch_size
     agent.dream.max_iterations = dream_cfg.max_iterations
     agent.dream.annotate_line_ages = dream_cfg.annotate_line_ages
-    from nanobot.cron.types import CronJob, CronPayload
+    from nanobot.cron.types import CronJob, CronPayload, CronSchedule
     cron.register_system_job(CronJob(
         id="dream",
         name="dream",
@@ -924,6 +931,25 @@ def _run_gateway(
         payload=CronPayload(kind="system_event"),
     ))
     console.print(f"[green]✓[/green] Dream: {dream_cfg.describe_schedule()}")
+
+    # Register the audit digest only when admins are configured — without
+    # them there's nothing to deliver to and no isolation to audit.
+    if config.agents.defaults.agent_admins:
+        digest_cfg = config.agents.defaults.audit_digest
+        cron.register_system_job(CronJob(
+            id="audit_digest",
+            name="audit_digest",
+            schedule=CronSchedule(
+                kind="cron",
+                expr=digest_cfg.cron,
+                tz=digest_cfg.tz or config.agents.defaults.timezone,
+            ),
+            payload=CronPayload(kind="system_event"),
+        ))
+        console.print(
+            f"[green]✓[/green] Audit digest: {digest_cfg.cron} "
+            f"({digest_cfg.tz or config.agents.defaults.timezone})"
+        )
 
     async def _open_browser_when_ready() -> None:
         """Wait for the gateway to bind, then point the user's browser at the webui."""
