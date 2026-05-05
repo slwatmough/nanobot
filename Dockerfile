@@ -1,6 +1,6 @@
 FROM ghcr.io/astral-sh/uv:python3.12-bookworm-slim
 
-# Install Node.js 20 for the WhatsApp bridge
+# Install Node.js 20 for the WhatsApp bridge, and 1password-cli
 RUN apt-get update && \
     apt-get install -y --no-install-recommends curl ca-certificates gnupg git bubblewrap openssh-client && \
     mkdir -p /etc/apt/keyrings && \
@@ -8,6 +8,10 @@ RUN apt-get update && \
     echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_20.x nodistro main" > /etc/apt/sources.list.d/nodesource.list && \
     apt-get update && \
     apt-get install -y --no-install-recommends nodejs && \
+    ARCH="$(dpkg --print-architecture)" && \
+    curl -fsSL https://downloads.1password.com/linux/keys/1password.asc | gpg --dearmor -o /etc/apt/keyrings/1password-archive-keyring.gpg && \
+    echo "deb [arch=$ARCH signed-by=/etc/apt/keyrings/1password-archive-keyring.gpg] https://downloads.1password.com/linux/debian/$ARCH stable main" > /etc/apt/sources.list.d/1password.list && \
+    apt-get install -y --no-install-recommends 1password-cli pipx && \
     apt-get purge -y gnupg && \
     apt-get autoremove -y && \
     rm -rf /var/lib/apt/lists/*
