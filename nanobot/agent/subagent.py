@@ -18,6 +18,12 @@ from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.search import GlobTool, GrepTool
 from nanobot.agent.tools.shell import ExecTool
 from nanobot.agent.tools.web import WebFetchTool, WebSearchTool
+from nanobot.agent.workspace_context import (
+    WorkspaceBinding,
+    bind_workspace,
+    get_workspace_binding,
+    reset_workspace,
+)
 from nanobot.bus.events import InboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.config.schema import AgentDefaults, ExecToolConfig, WebToolsConfig
@@ -115,11 +121,41 @@ class SubagentManager:
         origin_chat_id: str = "direct",
         session_key: str | None = None,
         origin_message_id: str | None = None,
+        admin: bool = False,
     ) -> str:
-        """Spawn a subagent to execute a task in the background."""
+        """Spawn a subagent to execute a task in the background.
+
+        The subagent inherits the parent turn's WorkspaceBinding so its
+        tools resolve against the same per-user workspace. ``admin=True``
+        is honored only when the parent itself is admin — non-admin
+        parents cannot escalate via spawn.
+        """
         task_id = str(uuid.uuid4())[:8]
         display_label = label or task[:30] + ("..." if len(task) > 30 else "")
         origin = {"channel": origin_channel, "chat_id": origin_chat_id, "session_key": session_key}
+
+        # Capture the parent's binding now (before spawning the task) so the
+        # subagent's tools see the parent's user_key, not whatever happens
+        # to be bound later when the task runs.
+        parent_binding = get_workspace_binding()
+        parent_is_admin = bool(parent_binding and parent_binding.is_admin)
+        # An admin-spawned admin subagent stays admin; otherwise non-admin
+        # parents cannot escalate via the admin flag.
+        effective_admin = admin and parent_is_admin
+        if parent_binding is not None:
+            sub_binding = WorkspaceBinding(
+                default_dir=(
+                    parent_binding.audit_root
+                    if effective_admin and parent_binding.audit_root is not None
+                    else parent_binding.default_dir
+                ),
+                extra_allowed_dirs=list(parent_binding.extra_allowed_dirs),
+                is_admin=effective_admin,
+                user_key=parent_binding.user_key,
+                audit_root=parent_binding.audit_root,
+            )
+        else:
+            sub_binding = None
 
         status = SubagentStatus(
             task_id=task_id,
@@ -130,7 +166,10 @@ class SubagentManager:
         self._task_statuses[task_id] = status
 
         bg_task = asyncio.create_task(
-            self._run_subagent(task_id, task, display_label, origin, status, origin_message_id)
+            self._run_subagent(
+                task_id, task, display_label, origin, status, origin_message_id,
+                binding=sub_binding,
+            )
         )
         self._running_tasks[task_id] = bg_task
         if session_key:
@@ -157,6 +196,7 @@ class SubagentManager:
         origin: dict[str, str],
         status: SubagentStatus,
         origin_message_id: str | None = None,
+        binding: WorkspaceBinding | None = None,
     ) -> None:
         """Execute the subagent task and announce the result."""
         logger.info("Subagent [{}] starting task: {}", task_id, label)
@@ -165,6 +205,9 @@ class SubagentManager:
             status.phase = payload.get("phase", status.phase)
             status.iteration = payload.get("iteration", status.iteration)
 
+        ws_token = None
+        if binding is not None:
+            ws_token = bind_workspace(binding)
         try:
             # Build subagent tools (no message tool, no spawn tool)
             tools = ToolRegistry()
@@ -232,24 +275,27 @@ class SubagentManager:
                 await self._announce_result(
                     task_id, label, task,
                     self._format_partial_progress(result),
-                    origin, "error", origin_message_id,
+                    origin, "error", origin_message_id, binding,
                 )
             elif result.stop_reason == "error":
                 await self._announce_result(
                     task_id, label, task,
                     result.error or "Error: subagent execution failed.",
-                    origin, "error", origin_message_id,
+                    origin, "error", origin_message_id, binding,
                 )
             else:
                 final_result = result.final_content or "Task completed but no final response was generated."
                 logger.info("Subagent [{}] completed successfully", task_id)
-                await self._announce_result(task_id, label, task, final_result, origin, "ok", origin_message_id)
+                await self._announce_result(task_id, label, task, final_result, origin, "ok", origin_message_id, binding)
 
         except Exception as e:
             status.phase = "error"
             status.error = str(e)
             logger.error("Subagent [{}] failed: {}", task_id, e)
-            await self._announce_result(task_id, label, task, f"Error: {e}", origin, "error", origin_message_id)
+            await self._announce_result(task_id, label, task, f"Error: {e}", origin, "error", origin_message_id, binding)
+        finally:
+            if ws_token is not None:
+                reset_workspace(ws_token)
 
     async def _announce_result(
         self,
@@ -260,6 +306,7 @@ class SubagentManager:
         origin: dict[str, str],
         status: str,
         origin_message_id: str | None = None,
+        binding: WorkspaceBinding | None = None,
     ) -> None:
         """Announce the subagent result to the main agent via the message bus."""
         status_text = "completed successfully" if status == "ok" else "failed"
@@ -284,6 +331,12 @@ class SubagentManager:
         }
         if origin_message_id:
             metadata["origin_message_id"] = origin_message_id
+        # Carry the parent's user_key + admin flag so the loop's
+        # _binding_from_message rebinds the originating user's workspace
+        # when the announce re-enters the message bus as a system message.
+        if binding is not None and binding.user_key:
+            metadata["subagent_user_key"] = binding.user_key
+            metadata["subagent_is_admin"] = binding.is_admin
         msg = InboundMessage(
             channel="system",
             sender_id="subagent",

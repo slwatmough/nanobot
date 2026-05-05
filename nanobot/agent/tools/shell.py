@@ -14,6 +14,7 @@ from loguru import logger
 from nanobot.agent.tools.base import Tool, tool_parameters
 from nanobot.agent.tools.sandbox import wrap_command
 from nanobot.agent.tools.schema import IntegerSchema, StringSchema, tool_parameters_schema
+from nanobot.agent.workspace_context import WorkspaceBinding, get_workspace_binding
 from nanobot.config.paths import get_media_dir
 
 _IS_WINDOWS = sys.platform == "win32"
@@ -101,17 +102,29 @@ class ExecTool(Tool):
         self, command: str, working_dir: str | None = None,
         timeout: int | None = None, **kwargs: Any,
     ) -> str:
-        cwd = working_dir or self.working_dir or os.getcwd()
+        binding = get_workspace_binding()
+        # Per-user binding overrides the static working_dir / boundary at
+        # call time. Admin bindings drop the per-user fence (the loop's
+        # static restrict_to_workspace still confines to the host root).
+        active_working_dir = self.working_dir
+        active_boundary = self.working_dir
+        if binding is not None:
+            active_working_dir = str(binding.default_dir)
+            active_boundary = (
+                None if binding.is_admin else str(binding.default_dir)
+            )
+
+        cwd = working_dir or active_working_dir or os.getcwd()
 
         # Prevent an LLM-supplied working_dir from escaping the configured
         # workspace when restrict_to_workspace is enabled (#2826). Without
         # this, a caller can pass working_dir="/etc" and then all absolute
         # paths under /etc would pass the _guard_command check that anchors
         # on cwd.
-        if self.restrict_to_workspace and self.working_dir:
+        if self.restrict_to_workspace and active_boundary:
             try:
                 requested = Path(cwd).expanduser().resolve()
-                workspace_root = Path(self.working_dir).expanduser().resolve()
+                workspace_root = Path(active_boundary).expanduser().resolve()
             except Exception:
                 return "Error: working_dir could not be resolved"
             if requested != workspace_root and workspace_root not in requested.parents:
@@ -128,7 +141,7 @@ class ExecTool(Tool):
                     self.sandbox,
                 )
             else:
-                workspace = self.working_dir or cwd
+                workspace = active_working_dir or cwd
                 command = wrap_command(self.sandbox, command, workspace, cwd)
                 cwd = str(Path(workspace).resolve())
 

@@ -38,9 +38,11 @@ from nanobot.agent.tools.self import MyTool
 from nanobot.agent.tools.shell import ExecTool
 from nanobot.agent.tools.spawn import SpawnTool
 from nanobot.agent.tools.web import WebFetchTool, WebSearchTool
+from nanobot.agent.workspace_context import WorkspaceBinding, bind_workspace, reset_workspace
 from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.command import CommandContext, CommandRouter, register_builtin_commands
+from nanobot.config.paths import get_media_dir
 from nanobot.config.schema import AgentDefaults
 from nanobot.providers.base import LLMProvider
 from nanobot.providers.factory import ProviderSnapshot
@@ -55,6 +57,11 @@ from nanobot.utils.progress_events import (
     on_progress_accepts_tool_events,
 )
 from nanobot.utils.runtime import EMPTY_FINAL_RESPONSE_MESSAGE
+from nanobot.utils.user_keys import (
+    canonical_sender_id,
+    parse_admin_entry,
+    user_workspace_key,
+)
 
 if TYPE_CHECKING:
     from nanobot.config.schema import ChannelsConfig, ExecToolConfig, ToolsConfig, WebToolsConfig
@@ -79,6 +86,7 @@ class _LoopHook(AgentHook):
         message_id: str | None = None,
         metadata: dict[str, Any] | None = None,
         session_key: str | None = None,
+        sender_id: str | None = None,
     ) -> None:
         super().__init__(reraise=True)
         self._loop = agent_loop
@@ -90,6 +98,7 @@ class _LoopHook(AgentHook):
         self._message_id = message_id
         self._metadata = metadata or {}
         self._session_key = session_key
+        self._sender_id = sender_id
         self._stream_buf = ""
 
     def wants_streaming(self) -> bool:
@@ -138,7 +147,9 @@ class _LoopHook(AgentHook):
             self._message_id,
             self._metadata,
             session_key=self._session_key,
+            sender_id=self._sender_id,
         )
+        self._loop._maybe_audit_tool_calls(context.tool_calls)
 
     async def after_iteration(self, context: AgentHookContext) -> None:
         if (
@@ -210,6 +221,7 @@ class AgentLoop:
         tools_config: ToolsConfig | None = None,
         provider_snapshot_loader: Callable[[], ProviderSnapshot] | None = None,
         provider_signature: tuple[object, ...] | None = None,
+        agent_admins: list[str] | None = None,
     ):
         from nanobot.config.schema import ExecToolConfig, ToolsConfig, WebToolsConfig
 
@@ -221,6 +233,26 @@ class AgentLoop:
         self._provider_snapshot_loader = provider_snapshot_loader
         self._provider_signature = provider_signature
         self.workspace = workspace
+        self._agent_admins = self._parse_admin_entries(agent_admins or [])
+        self._workspace_log_seen: set[str] = set()
+        if not restrict_to_workspace and self._agent_admins:
+            # Per-user isolation needs the boundary check; warn loudly so
+            # operators understand non-admin users are still confined to
+            # their per-user dirs by the FsTool fallback.
+            logger.warning(
+                "restrict_to_workspace is disabled but agent_admins is "
+                "configured — non-admin users will still be confined to "
+                "their per-user workspaces, but admins keep host-wide "
+                "filesystem access."
+            )
+        if self._agent_admins:
+            logger.info(
+                "Agent admins configured: {}",
+                ", ".join(
+                    f"{ch or '*'}:{sid}" for ch, sid in self._agent_admins
+                ),
+            )
+            self._warn_about_migration_candidates()
         self.model = model or provider.get_default_model()
         self.max_iterations = (
             max_iterations if max_iterations is not None else defaults.max_tool_iterations
@@ -311,6 +343,225 @@ class AgentLoop:
         self._current_iteration: int = 0
         self.commands = CommandRouter()
         register_builtin_commands(self.commands)
+
+    def _warn_about_migration_candidates(self) -> None:
+        """Log a one-time warning when pre-isolation files live at the root."""
+        from nanobot.utils.helpers import detect_workspace_migration_candidates
+
+        try:
+            candidates = detect_workspace_migration_candidates(self.workspace)
+        except OSError:
+            return
+        if not candidates:
+            return
+        logger.warning(
+            "Per-user isolation is enabled but {} user-generated entries "
+            "still live at {}. Move them into shared/ so non-admin users "
+            "can still see them, e.g.: mv {} {}",
+            len(candidates),
+            self.workspace,
+            " ".join(repr(str(c)) for c in candidates[:5]),
+            self.workspace / "shared",
+        )
+
+    @staticmethod
+    def _parse_admin_entries(entries: list[str]) -> list[tuple[str | None, str]]:
+        """Parse ``agent_admins`` into ``(channel, canonical_sender_id)`` tuples."""
+        parsed: list[tuple[str | None, str]] = []
+        for raw in entries:
+            channel, sender = parse_admin_entry(raw)
+            if not sender:
+                continue
+            canon = canonical_sender_id(channel or "", sender)
+            parsed.append((channel, canon))
+        return parsed
+
+    def _is_admin(self, channel: str, sender_id: str) -> bool:
+        """Return whether this identity is on the admin allow-list."""
+        if not self._agent_admins:
+            return False
+        canonical = canonical_sender_id(channel, sender_id)
+        for admin_channel, admin_sender in self._agent_admins:
+            if admin_sender != canonical:
+                continue
+            if admin_channel is None or admin_channel == channel.lower():
+                return True
+        return False
+
+    def _users_root(self) -> Path:
+        return self.workspace / "users"
+
+    def _shared_dir(self) -> Path:
+        return self.workspace / "shared"
+
+    def _skills_dir(self) -> Path:
+        return self.workspace / "skills"
+
+    def _audit_log_path(self) -> Path:
+        return self.workspace / "audit.log"
+
+    def _binding_from_message(self, msg: InboundMessage) -> WorkspaceBinding:
+        """Compute the WorkspaceBinding for an inbound message.
+
+        Handles three cases:
+          - System subagent announces: parent's user_key + is_admin live in
+            ``msg.metadata['subagent_user_key']`` and ``['subagent_is_admin']``.
+            Re-bind to the originating user so the subagent's tools resolve
+            against the same per-user workspace as the parent turn.
+          - Cron / heartbeat: ``msg.metadata['creator_sender_id']`` and
+            ``['creator_channel']`` thread through the human who created
+            the cron entry. When absent (legacy jobs), bind admin and warn.
+          - Regular user messages: use ``msg.channel`` + ``msg.sender_id``.
+        """
+        meta = msg.metadata or {}
+
+        # Subagent announces always re-enter as system messages.
+        if msg.channel == "system" and msg.sender_id == "subagent":
+            user_key = meta.get("subagent_user_key")
+            is_admin = bool(meta.get("subagent_is_admin"))
+            if user_key:
+                inferred_channel, _, inferred_sender = user_key.partition("__")
+                if inferred_channel and inferred_sender:
+                    return self._resolve_user_binding(
+                        inferred_channel,
+                        inferred_sender,
+                        force_admin=is_admin,
+                    )
+            return self._resolve_user_binding("system", "subagent", force_admin=True)
+
+        # Cron / heartbeat / system event: prefer explicit creator metadata
+        # over channel/sender_id (which for cron is "user"/"cron" and would
+        # otherwise create a generic per-system user dir).
+        creator_sender = meta.get("creator_sender_id")
+        creator_channel = meta.get("creator_channel")
+        if creator_sender:
+            return self._resolve_user_binding(
+                str(creator_channel or msg.channel or "system"),
+                str(creator_sender),
+            )
+
+        if msg.channel == "system":
+            if not getattr(self, "_legacy_system_warned", False):
+                self._legacy_system_warned = True
+                logger.warning(
+                    "System message without creator_sender_id metadata — "
+                    "binding to admin workspace. Re-create cron jobs to "
+                    "attribute them to a specific user."
+                )
+            return self._resolve_user_binding("system", "system", force_admin=True)
+
+        return self._resolve_user_binding(msg.channel, msg.sender_id)
+
+    def _resolve_user_binding(
+        self,
+        channel: str,
+        sender_id: str,
+        *,
+        force_admin: bool = False,
+    ) -> WorkspaceBinding:
+        """Compute the WorkspaceBinding for a given inbound identity."""
+        is_admin = force_admin or self._is_admin(channel, sender_id)
+        media_dir = get_media_dir()
+        if is_admin or not sender_id:
+            return WorkspaceBinding(
+                default_dir=self.workspace,
+                extra_allowed_dirs=[media_dir],
+                is_admin=True,
+                user_key=None if not sender_id else user_workspace_key(channel or "system", sender_id),
+                audit_root=self.workspace,
+            )
+        key = user_workspace_key(channel, sender_id)
+        user_dir = self._users_root() / key
+        user_dir.mkdir(parents=True, exist_ok=True)
+        shared = self._shared_dir()
+        shared.mkdir(parents=True, exist_ok=True)
+        skills = self._skills_dir()
+        # skills may not exist on a fresh deployment; do not force-create
+        # if it's not there (read-only area).
+        extras = [shared, skills, media_dir]
+        return WorkspaceBinding(
+            default_dir=user_dir,
+            extra_allowed_dirs=extras,
+            is_admin=False,
+            user_key=key,
+            audit_root=self.workspace,
+        )
+
+    def _log_workspace_bind_once(self, binding: WorkspaceBinding, session_key: str) -> None:
+        """Emit one info-level log per session+role; debug after that."""
+        marker = f"{session_key}:{'admin' if binding.is_admin else 'user'}:{binding.user_key or '-'}"
+        if marker in self._workspace_log_seen:
+            logger.debug(
+                "Workspace bind (session={}, admin={}, key={}, dir={})",
+                session_key,
+                binding.is_admin,
+                binding.user_key,
+                binding.default_dir,
+            )
+            return
+        self._workspace_log_seen.add(marker)
+        logger.info(
+            "Workspace bind (session={}, admin={}, key={}, dir={})",
+            session_key,
+            binding.is_admin,
+            binding.user_key,
+            binding.default_dir,
+        )
+
+    _AUDITED_TOOLS = frozenset({
+        "read_file", "write_file", "edit_file", "list_dir",
+        "glob", "grep", "notebook_edit", "exec",
+    })
+
+    def _maybe_audit_tool_calls(self, tool_calls: list[Any]) -> None:
+        """Append an audit record for admin tool calls touching the FS."""
+        from nanobot.agent.workspace_context import get_workspace_binding
+
+        binding = get_workspace_binding()
+        if binding is None or not binding.is_admin:
+            return
+        for tc in tool_calls:
+            name = getattr(tc, "name", None)
+            if name not in self._AUDITED_TOOLS:
+                continue
+            args = getattr(tc, "arguments", {}) or {}
+            path = (
+                args.get("path")
+                or args.get("working_dir")
+                or args.get("command")
+                or ""
+            )
+            self._audit_admin_access(
+                binding,
+                action=name,
+                detail={"path": str(path)[:500]},
+            )
+
+    def _audit_admin_access(
+        self,
+        binding: WorkspaceBinding,
+        action: str,
+        detail: dict[str, Any] | None = None,
+    ) -> None:
+        """Append a JSONL record to the audit log for admin/cross-user actions."""
+        if binding.audit_root is None:
+            return
+        from datetime import datetime
+
+        record = {
+            "ts": datetime.now().isoformat(),
+            "user_key": binding.user_key,
+            "is_admin": binding.is_admin,
+            "action": action,
+            **(detail or {}),
+        }
+        try:
+            path = self._audit_log_path()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a", encoding="utf-8") as fp:
+                fp.write(json.dumps(record, ensure_ascii=False) + "\n")
+        except OSError as exc:
+            logger.warning("Audit log write failed: {}", exc)
 
     def _sync_subagent_runtime_limits(self) -> None:
         """Keep subagent runtime limits aligned with mutable loop settings."""
@@ -426,6 +677,7 @@ class AgentLoop:
         self, channel: str, chat_id: str,
         message_id: str | None = None, metadata: dict | None = None,
         session_key: str | None = None,
+        sender_id: str | None = None,
     ) -> None:
         """Update context for all tools that need routing info."""
         # When the caller threads a thread-scoped session_key (e.g. slack with
@@ -445,8 +697,24 @@ class AgentLoop:
                         tool.set_context(channel, chat_id, effective_key=effective_key)
                         if hasattr(tool, "set_origin_message_id"):
                             tool.set_origin_message_id(message_id)
+                        if hasattr(tool, "set_sender_id"):
+                            tool.set_sender_id(sender_id)
                     elif name == "cron":
-                        tool.set_context(channel, chat_id, metadata=metadata, session_key=session_key)
+                        kwargs: dict[str, Any] = {
+                            "metadata": metadata,
+                            "session_key": session_key,
+                        }
+                        # Only pass sender_id when the bound implementation
+                        # accepts it (test mocks may use the older signature).
+                        try:
+                            import inspect
+
+                            params = inspect.signature(tool.set_context).parameters
+                            if "sender_id" in params:
+                                kwargs["sender_id"] = sender_id
+                        except (TypeError, ValueError):
+                            pass
+                        tool.set_context(channel, chat_id, **kwargs)
                     elif name == "message":
                         tool.set_context(channel, chat_id, message_id, metadata=metadata)
                     else:
@@ -534,6 +802,8 @@ class AgentLoop:
         metadata: dict[str, Any] | None = None,
         session_key: str | None = None,
         pending_queue: asyncio.Queue | None = None,
+        workspace_binding: WorkspaceBinding | None = None,
+        sender_id: str | None = None,
     ) -> tuple[str | None, list[str], list[dict], str, bool]:
         """Run the agent iteration loop.
 
@@ -556,6 +826,7 @@ class AgentLoop:
             message_id=message_id,
             metadata=metadata,
             session_key=session_key,
+            sender_id=sender_id,
         )
         hook: AgentHook = (
             CompositeHook([loop_hook] + self._extra_hooks) if self._extra_hooks else loop_hook
@@ -628,6 +899,16 @@ class AgentLoop:
 
         active_session_key = session.key if session else session_key
         file_state_token = bind_file_states(self._file_state_store.for_session(active_session_key))
+        ws_token = None
+        if workspace_binding is not None:
+            self._log_workspace_bind_once(workspace_binding, active_session_key or "-")
+            ws_token = bind_workspace(workspace_binding)
+            # Resolve the per-user workspace for downstream tools (where
+            # supported). Falls back to the loop workspace for tools that
+            # do not yet read the binding.
+            runner_workspace = workspace_binding.default_dir
+        else:
+            runner_workspace = self.workspace
         try:
             result = await self.runner.run(AgentRunSpec(
                 initial_messages=initial_messages,
@@ -638,7 +919,7 @@ class AgentLoop:
                 hook=hook,
                 error_message="Sorry, I encountered an error calling the AI model.",
                 concurrent_tools=True,
-                workspace=self.workspace,
+                workspace=runner_workspace,
                 session_key=session.key if session else None,
                 context_window_tokens=self.context_window_tokens,
                 context_block_limit=self.context_block_limit,
@@ -650,6 +931,8 @@ class AgentLoop:
             ))
         finally:
             reset_file_states(file_state_token)
+            if ws_token is not None:
+                reset_workspace(ws_token)
         self._last_usage = result.usage
         if result.stop_reason == "max_iterations":
             logger.warning("Max iterations ({}) reached", self.max_iterations)
@@ -915,6 +1198,7 @@ class AgentLoop:
             self._set_tool_context(
                 channel, chat_id, msg.metadata.get("message_id"),
                 msg.metadata, session_key=key,
+                sender_id=msg.sender_id,
             )
             _hist_kwargs: dict[str, Any] = {
                 "max_messages": self._max_messages,
@@ -935,12 +1219,15 @@ class AgentLoop:
                 current_role=current_role,
                 sender_id=msg.sender_id,
             )
+            binding = self._binding_from_message(msg)
             final_content, _, all_msgs, stop_reason, _ = await self._run_agent_loop(
                 messages, session=session, channel=channel, chat_id=chat_id,
                 message_id=msg.metadata.get("message_id"),
                 metadata=msg.metadata,
                 session_key=key,
                 pending_queue=pending_queue,
+                workspace_binding=binding,
+                sender_id=msg.sender_id,
             )
             self._save_turn(session, all_msgs, 1 + len(history))
             session.enforce_file_cap(on_archive=self.context.memory.raw_archive)
@@ -1003,6 +1290,7 @@ class AgentLoop:
         self._set_tool_context(
             msg.channel, msg.chat_id, msg.metadata.get("message_id"),
             msg.metadata, session_key=key,
+            sender_id=msg.sender_id,
         )
         if message_tool := self.tools.get("message"):
             if isinstance(message_tool, MessageTool):
@@ -1081,6 +1369,7 @@ class AgentLoop:
             self.sessions.save(session)
             user_persisted_early = True
 
+        binding = self._binding_from_message(msg)
         final_content, _, all_msgs, stop_reason, had_injections = await self._run_agent_loop(
             initial_messages,
             on_progress=on_progress or _bus_progress,
@@ -1094,6 +1383,8 @@ class AgentLoop:
             metadata=msg.metadata,
             session_key=key,
             pending_queue=pending_queue,
+            workspace_binding=binding,
+            sender_id=msg.sender_id,
         )
 
         if final_content is None or not final_content.strip():
@@ -1357,12 +1648,15 @@ class AgentLoop:
         on_progress: Callable[..., Awaitable[None]] | None = None,
         on_stream: Callable[[str], Awaitable[None]] | None = None,
         on_stream_end: Callable[..., Awaitable[None]] | None = None,
+        sender_id: str = "user",
+        metadata: dict[str, Any] | None = None,
     ) -> OutboundMessage | None:
         """Process a message directly and return the outbound payload."""
         await self._connect_mcp()
         msg = InboundMessage(
-            channel=channel, sender_id="user", chat_id=chat_id,
+            channel=channel, sender_id=sender_id, chat_id=chat_id,
             content=content, media=media or [],
+            metadata=dict(metadata) if metadata else {},
         )
         return await self._process_message(
             msg,

@@ -519,6 +519,8 @@ def sync_workspace_templates(workspace: Path, silent: bool = False) -> list[str]
     _write(tpl / "memory" / "MEMORY.md", workspace / "memory" / "MEMORY.md")
     _write(None, workspace / "memory" / "history.jsonl")
     (workspace / "skills").mkdir(exist_ok=True)
+    (workspace / "shared").mkdir(exist_ok=True)
+    (workspace / "users").mkdir(exist_ok=True)
 
     if added and not silent:
         from rich.console import Console
@@ -543,3 +545,51 @@ def sync_workspace_templates(workspace: Path, silent: bool = False) -> list[str]
         logger.warning("Failed to initialize git store for {}", workspace)
 
     return added
+
+
+# Files / directories at the workspace root that are agent-internal and
+# should NOT be migrated into ``shared/`` when per-user isolation is
+# enabled. Anything else at the root is presumed to be user-generated
+# from a pre-isolation deployment.
+_WORKSPACE_INTERNAL_NAMES = frozenset({
+    "SOUL.md",
+    "USER.md",
+    "AGENT.md",
+    "PRIVACY_POLICY.md",
+    "AGENTS.md",
+    "CLAUDE.md",
+    "README.md",
+    "audit.log",
+    "memory",
+    "sessions",
+    "skills",
+    "media",
+    "shared",
+    "users",
+    "cron",
+    ".git",
+    ".gitignore",
+    ".nanobot",
+})
+
+
+def detect_workspace_migration_candidates(workspace: Path) -> list[Path]:
+    """List user-generated entries at the workspace root that should move into shared/.
+
+    Returns an empty list when the workspace is empty, when no migration is
+    needed, or when the workspace path doesn't exist. The result is stable
+    across re-runs (idempotent): once an entry has been moved into
+    ``shared/`` the next call returns nothing for it.
+    """
+    if not workspace.exists() or not workspace.is_dir():
+        return []
+    candidates: list[Path] = []
+    for entry in sorted(workspace.iterdir()):
+        if entry.name in _WORKSPACE_INTERNAL_NAMES:
+            continue
+        if entry.name.startswith("."):
+            # Hidden files (lockfiles, dotenv, dotfiles) tend to be tooling
+            # state, not user content. Leave them at the root.
+            continue
+        candidates.append(entry)
+    return candidates

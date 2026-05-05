@@ -646,6 +646,7 @@ def _run_gateway(
         tools_config=config.tools,
         provider_snapshot_loader=load_provider_snapshot,
         provider_signature=provider_snapshot.signature,
+        agent_admins=config.agents.defaults.agent_admins,
     )
 
     from nanobot.agent.loop import UNIFIED_SESSION_KEY
@@ -725,6 +726,15 @@ def _run_gateway(
         if isinstance(message_tool, MessageTool):
             message_record_token = message_tool.set_record_channel_delivery(True)
 
+        # Thread the cron creator's identity through so the agent binds to
+        # their per-user workspace, not the admin root. Legacy jobs without
+        # a creator fall back to the admin path inside _binding_from_message.
+        cron_metadata: dict[str, Any] = {}
+        if job.payload.creator_sender_id:
+            cron_metadata["creator_sender_id"] = job.payload.creator_sender_id
+        if job.payload.creator_channel:
+            cron_metadata["creator_channel"] = job.payload.creator_channel
+
         try:
             resp = await agent.process_direct(
                 reminder_note,
@@ -732,6 +742,7 @@ def _run_gateway(
                 channel=job.payload.channel or "cli",
                 chat_id=job.payload.to or "direct",
                 on_progress=_silent,
+                metadata=cron_metadata,
             )
         finally:
             if isinstance(cron_tool, CronTool) and cron_token is not None:

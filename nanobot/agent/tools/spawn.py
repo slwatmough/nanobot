@@ -4,7 +4,7 @@ from contextvars import ContextVar
 from typing import TYPE_CHECKING, Any
 
 from nanobot.agent.tools.base import Tool, tool_parameters
-from nanobot.agent.tools.schema import StringSchema, tool_parameters_schema
+from nanobot.agent.tools.schema import BooleanSchema, StringSchema, tool_parameters_schema
 
 if TYPE_CHECKING:
     from nanobot.agent.subagent import SubagentManager
@@ -14,6 +14,14 @@ if TYPE_CHECKING:
     tool_parameters_schema(
         task=StringSchema("The task for the subagent to complete"),
         label=StringSchema("Optional short label for the task (for display)"),
+        admin=BooleanSchema(
+            description=(
+                "Run the subagent with admin (root) workspace scope. Only "
+                "honored when the parent turn is itself admin; otherwise "
+                "ignored. Default false."
+            ),
+            default=False,
+        ),
         required=["task"],
     )
 )
@@ -29,6 +37,10 @@ class SpawnTool(Tool):
             "spawn_origin_message_id",
             default=None,
         )
+        self._sender_id: ContextVar[str | None] = ContextVar(
+            "spawn_sender_id",
+            default=None,
+        )
 
     def set_context(self, channel: str, chat_id: str, effective_key: str | None = None) -> None:
         """Set the origin context for subagent announcements."""
@@ -39,6 +51,10 @@ class SpawnTool(Tool):
     def set_origin_message_id(self, message_id: str | None) -> None:
         """Set the source message id for downstream deduplication."""
         self._origin_message_id.set(message_id)
+
+    def set_sender_id(self, sender_id: str | None) -> None:
+        """Set the originating sender's id (for per-user attribution)."""
+        self._sender_id.set(sender_id)
 
     @property
     def name(self) -> str:
@@ -54,7 +70,13 @@ class SpawnTool(Tool):
             "and use a dedicated subdirectory when helpful."
         )
 
-    async def execute(self, task: str, label: str | None = None, **kwargs: Any) -> str:
+    async def execute(
+        self,
+        task: str,
+        label: str | None = None,
+        admin: bool = False,
+        **kwargs: Any,
+    ) -> str:
         """Spawn a subagent to execute the given task."""
         return await self._manager.spawn(
             task=task,
@@ -63,4 +85,5 @@ class SpawnTool(Tool):
             origin_chat_id=self._origin_chat_id.get(),
             session_key=self._session_key.get(),
             origin_message_id=self._origin_message_id.get(),
+            admin=admin,
         )

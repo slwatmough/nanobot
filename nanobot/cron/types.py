@@ -29,6 +29,11 @@ class CronPayload:
     to: str | None = None  # e.g. phone number
     channel_meta: dict = field(default_factory=dict)  # channel-specific routing (e.g. Slack thread_ts)
     session_key: str | None = None  # original session key for correct session recording
+    # Identity of the human who scheduled the job, used to bind the
+    # per-user workspace at execution time. Empty for legacy jobs created
+    # before per-user isolation; those fall back to admin scope.
+    creator_channel: str | None = None
+    creator_sender_id: str | None = None
 
 
 @dataclass

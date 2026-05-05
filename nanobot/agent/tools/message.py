@@ -7,6 +7,7 @@ from typing import Any, Awaitable, Callable
 
 from nanobot.agent.tools.base import Tool, tool_parameters
 from nanobot.agent.tools.schema import ArraySchema, StringSchema, tool_parameters_schema
+from nanobot.agent.workspace_context import get_workspace_binding
 from nanobot.bus.events import OutboundMessage
 from nanobot.config.paths import get_workspace_path
 
@@ -39,7 +40,7 @@ class MessageTool(Tool):
         workspace: str | Path | None = None,
     ):
         self._send_callback = send_callback
-        self._workspace = Path(workspace).expanduser() if workspace is not None else get_workspace_path()
+        self._static_workspace = Path(workspace).expanduser() if workspace is not None else get_workspace_path()
         self._default_channel: ContextVar[str] = ContextVar("message_default_channel", default=default_channel)
         self._default_chat_id: ContextVar[str] = ContextVar("message_default_chat_id", default=default_chat_id)
         self._default_message_id: ContextVar[str | None] = ContextVar(
@@ -147,12 +148,14 @@ class MessageTool(Tool):
             return "Error: Message sending not configured"
 
         if media:
+            binding = get_workspace_binding()
+            base = binding.default_dir if binding is not None else self._static_workspace
             resolved = []
             for p in media:
                 if p.startswith(("http://", "https://")) or os.path.isabs(p):
                     resolved.append(p)
                 else:
-                    resolved.append(str(self._workspace / p))
+                    resolved.append(str(base / p))
             media = resolved
 
         metadata = dict(self._default_metadata.get()) if same_target else {}

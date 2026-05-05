@@ -101,6 +101,10 @@ class AgentDefaults(Base):
         validation_alias=AliasChoices("consolidationRatio"),
         serialization_alias="consolidationRatio",
     )  # Consolidation target ratio (0.5 = 50% of budget retained after compression)
+    # Identities that bypass per-user workspace isolation. Each entry is
+    # "channel:sender_id" (e.g. "telegram:123456789", "slack:U0123ABC"); a
+    # bare sender_id matches on any channel. Empty list = no admins.
+    agent_admins: list[str] = Field(default_factory=list)
     dream: DreamConfig = Field(default_factory=DreamConfig)
 
 

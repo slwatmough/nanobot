@@ -64,6 +64,7 @@ Channels (Telegram, Discord, …) → MessageBus.inbound → AgentLoop → Agent
 - **Pluggable providers and channels**: Add new ones by implementing the base class.
 - **MessageBus decoupling**: Channels never call the agent directly.
 - **Two-stage memory**: Consolidation (context pressure → history.jsonl) + Dream (history → refined SOUL/USER/MEMORY.md).
+- **Per-user workspace isolation**: When `agents.defaults.agent_admins` is configured, each non-admin user's filesystem tools resolve relative paths against `<workspace>/users/<channel>__<sender>/` and reject absolute paths outside their subtree. `<workspace>/shared/` is read+write to every user; `<workspace>/skills/` is read-only. Admins listed in `agent_admins` bypass the per-user fence and see the whole tree. The active binding is propagated via a `ContextVar` (`nanobot/agent/workspace_context.py`) so the same tool instances serve all users without re-registration.
 
 ## Code Style
 

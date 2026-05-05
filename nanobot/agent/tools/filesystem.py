@@ -10,6 +10,7 @@ from typing import Any
 from nanobot.agent.tools.base import Tool, tool_parameters
 from nanobot.agent.tools.schema import BooleanSchema, IntegerSchema, StringSchema, tool_parameters_schema
 from nanobot.agent.tools.file_state import FileStates, _hash_file, current_file_states
+from nanobot.agent.workspace_context import WorkspaceBinding, get_workspace_binding
 from nanobot.utils.helpers import build_image_content_blocks, detect_image_mime
 from nanobot.config.paths import get_media_dir
 
@@ -27,7 +28,7 @@ def _resolve_path(
     resolved = p.resolve()
     if allowed_dir:
         media_path = get_media_dir().resolve()
-        all_dirs = [allowed_dir] + [media_path] + (extra_allowed_dirs or []) 
+        all_dirs = [allowed_dir] + [media_path] + (extra_allowed_dirs or [])
         if not any(_is_under(resolved, d) for d in all_dirs):
             raise PermissionError(f"Path {path} is outside allowed directory {allowed_dir}")
     return resolved
@@ -51,9 +52,14 @@ class _FsTool(Tool):
         extra_allowed_dirs: list[Path] | None = None,
         file_states: FileStates | None = None,
     ):
-        self._workspace = workspace
-        self._allowed_dir = allowed_dir
-        self._extra_allowed_dirs = extra_allowed_dirs
+        # _static_* fields are the values supplied at construction time.
+        # When no per-user WorkspaceBinding is bound (Dream / explicit
+        # subagent paths / direct test instantiation), the tool falls back
+        # to these. When a binding is bound, it overrides them at call
+        # time so the same tool instance can serve different users.
+        self._static_workspace = workspace
+        self._static_allowed_dir = allowed_dir
+        self._static_extra_allowed_dirs = extra_allowed_dirs
         # Explicit state is used by isolated runners like Dream/subagents.
         # Main AgentLoop tools leave this unset and resolve state from the
         # current async task, which keeps shared tool instances session-safe.
@@ -65,6 +71,43 @@ class _FsTool(Tool):
         if self._explicit_file_states is not None:
             return self._explicit_file_states
         return current_file_states(self._fallback_file_states)
+
+    def _active_binding(self) -> WorkspaceBinding | None:
+        """Return the bound per-user WorkspaceBinding, if any."""
+        return get_workspace_binding()
+
+    @property
+    def _workspace(self) -> Path | None:
+        binding = self._active_binding()
+        if binding is not None:
+            return binding.default_dir
+        return self._static_workspace
+
+    @property
+    def _allowed_dir(self) -> Path | None:
+        binding = self._active_binding()
+        if binding is not None:
+            # Admin bypasses the per-user boundary check; the loop's
+            # restrict_to_workspace still confines to the host root via
+            # the static config.
+            if binding.is_admin:
+                return self._static_allowed_dir
+            # Non-admin users are always confined to their per-user dir,
+            # even when the deployment-wide restrict_to_workspace is off.
+            # Without this, per-user isolation would be defeated trivially.
+            return binding.default_dir
+        return self._static_allowed_dir
+
+    @property
+    def _extra_allowed_dirs(self) -> list[Path] | None:
+        binding = self._active_binding()
+        if binding is not None and not binding.is_admin:
+            extras = list(binding.extra_allowed_dirs)
+            for d in self._static_extra_allowed_dirs or []:
+                if d not in extras:
+                    extras.append(d)
+            return extras
+        return self._static_extra_allowed_dirs
 
     def _resolve(self, path: str) -> Path:
         return _resolve_path(path, self._workspace, self._allowed_dir, self._extra_allowed_dirs)

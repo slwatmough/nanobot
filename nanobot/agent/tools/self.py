@@ -334,6 +334,20 @@ class MyTool(Tool):
         for k in ("workspace", "provider_retry_mode", "max_tool_result_chars", "_current_iteration", "web_config", "exec_config", "subagents"):
             if _has_real_attr(loop, k):
                 parts.append(self._format_value(getattr(loop, k, None), k))
+        # Active workspace binding (per-user vs admin) for the current turn.
+        try:
+            from nanobot.agent.workspace_context import get_workspace_binding
+
+            binding = get_workspace_binding()
+        except Exception:
+            binding = None
+        if binding is not None:
+            parts.append(
+                "active_workspace: "
+                f"dir={binding.default_dir} "
+                f"is_admin={binding.is_admin} "
+                f"user_key={binding.user_key or '-'}"
+            )
         # Token usage
         usage = loop._last_usage
         if usage:
